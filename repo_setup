@@ -1,0 +1,99 @@
+import json
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime, UTC
+
+# --- CONFIGURACIÓN DE LA BASE DE DATOS ---
+DB_NAME = 'game_repo.db'
+ENGINE = create_engine(f'sqlite:///{DB_NAME}')
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=ENGINE)
+
+# --- MODELOS DE LA BASE DE DATOS (REPO) ---
+
+class Game(Base):
+    """Modelo para los datos maestros del juego (datos de Steam y referencia)."""
+    __tablename__ = 'game'
+    
+    id = Column(Integer, primary_key=True)
+    title = Column(String, nullable=False)
+    # NUEVO: Campo para la URL de la portada
+    cover_image_url = Column(String) 
+    reference_price = Column(Float)
+    release_date = Column(String)
+    genres = Column(String)
+    steam_rating = Column(Float)
+    
+    # Relación con la tabla de precios
+    prices = relationship("PriceData", back_populates="game", cascade="all, delete-orphan")
+
+class PriceData(Base):
+    """Modelo para los datos de precios recolectados por los scrapers."""
+    __tablename__ = 'prices'
+    
+    id = Column(Integer, primary_key=True)
+    # CORRECCIÓN CLAVE: Definir explícitamente la ForeignKey
+    game_id = Column(Integer, ForeignKey('game.id'), nullable=False) 
+    store_name = Column(String, nullable=False)
+    platform = Column(String)
+    current_price = Column(Float)
+    discount_percentage = Column(Float)
+    url = Column(String)
+    last_updated = Column(DateTime, default=datetime.now(UTC))
+
+    # Relación inversa
+    game = relationship("Game", back_populates="prices")
+
+# --- DATOS INICIALES ---
+GAME_DATA_JSON = [
+    {"id": 1, "title": "Elden Ring", "reference_price": 59.99},
+    {"id": 2, "title": "Baldur's Gate 3", "reference_price": 59.99},
+    {"id": 3, "title": "Cyberpunk 2077", "reference_price": 59.99},
+    {"id": 4, "title": "Red Dead Redemption 2", "reference_price": 59.99},
+    {"id": 5, "title": "The Witcher 3: Wild Hunt", "reference_price": 39.99},
+    {"id": 6, "title": "Stardew Valley", "reference_price": 14.99},
+    {"id": 7, "title": "Counter-Strike 2", "reference_price": 0.00},
+    {"id": 8, "title": "Hades", "reference_price": 24.99},
+    {"id": 9, "title": "Terraria", "reference_price": 9.99},
+    {"id": 10, "title": "Monster Hunter: World", "reference_price": 29.99},
+    {"id": 11, "title": "Resident Evil 4 (Remake)", "reference_price": 59.99},
+    {"id": 12, "title": "Persona 5 Royal", "reference_price": 59.99}
+]
+
+# --- FUNCIONES DE SETUP ---
+
+def setup_database(initial_data):
+    """Crea la base de datos y las tablas, y carga los datos iniciales."""
+    # 1. Eliminar y crear todas las tablas (importante para actualizar el esquema)
+    Base.metadata.drop_all(ENGINE)
+    Base.metadata.create_all(ENGINE)
+    
+    session = SessionLocal()
+    try:
+        # 2. Cargar datos de juegos iniciales
+        for game_data in initial_data:
+            # Los datos extraídos por el scraper serán null en la carga inicial
+            new_game = Game(
+                id=game_data['id'],
+                title=game_data['title'],
+                cover_image_url=None, # Se rellena en scraper_multicore.py
+                reference_price=game_data['reference_price'],
+                release_date=None, 
+                genres=None,
+                steam_rating=None
+            )
+            session.add(new_game)
+        
+        session.commit()
+        print("Datos iniciales de juegos cargados correctamente.")
+
+    except Exception as e:
+        session.rollback()
+        print(f"Error al cargar datos iniciales: {e}")
+    finally:
+        session.close()
+
+if __name__ == '__main__':
+    print(f"Base de datos '{DB_NAME}' lista. Cargando datos iniciales...")
+    setup_database(GAME_DATA_JSON)
