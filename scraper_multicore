@@ -1,0 +1,344 @@
+import requests
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+# Importación de UTC para eliminar el warning de Deprecation
+from datetime import datetime, UTC 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import re
+from playwright.sync_api import sync_playwright
+
+# IMPORTANTE: Asegúrate de que tu archivo repo_setup.py esté en la misma carpeta 
+from repo_setup import Game, PriceData
+
+# --- CONFIGURACIÓN GLOBAL ---
+DB_NAME = 'game_repo.db' 
+MAX_WORKERS = 6 
+ENGINE = create_engine(f'sqlite:///{DB_NAME}')
+SessionLocal = sessionmaker(bind=ENGINE) 
+
+# Helper: Búsqueda de AppID de Steam (Simplificación)
+STEAM_APP_IDS = {
+    "Elden Ring": "1245620",
+    "Baldur's Gate 3": "1086940",
+    "Cyberpunk 2077": "1091500",
+    "Red Dead Redemption 2": "1174180",
+    "The Witcher 3: Wild Hunt": "292030",
+    "Stardew Valley": "413150",
+    "Counter-Strike 2": "730", 
+    "Hades": "1145360",
+    "Terraria": "105600",
+    "Monster Hunter: World": "582010",
+    "Resident Evil 4 (Remake)": "2050650",
+    "Persona 5 Royal": "1687950"
+}
+
+# -------------------------------------------------------------
+# 1. SCRAPER DE STEAM (API)
+# -------------------------------------------------------------
+def scrape_steam_data(game_id: int, game_title: str):
+    """
+    Obtiene datos generales (rating, géneros), precio y PORTADA de Steam usando la API.
+    Actualiza las tablas Game y PriceData de forma segura para hilos.
+    """
+    app_id = STEAM_APP_IDS.get(game_title)
+    if not app_id:
+        return
+
+    session = SessionLocal() 
+    
+    try:
+        url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc=ES&l=spanish"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json().get(app_id, {})
+        
+        if not data.get("success"):
+            return
+
+        details = data.get("data", {})
+        
+        # --- A. Actualizar tabla 'Game' (datos generales y PORTADA) ---
+        game_db = session.query(Game).filter(Game.id == game_id).one_or_none()
+        if game_db:
+            # 1. Extracción y guardado de la URL de la portada (NUEVO)
+            cover_url = details.get("header_image")
+            game_db.cover_image_url = cover_url 
+            
+            # 2. Otros datos
+            game_db.release_date = details.get("release_date", {}).get("date", "N/A")
+            genres = [g.get("description") for g in details.get("genres", [])]
+            game_db.genres = ", ".join(genres)
+            game_db.steam_rating = details.get("metacritic", {}).get("score") 
+
+        # --- B. Insertar/Actualizar tabla 'PriceData' (datos de precio) ---
+        price_data = details.get("price_overview")
+        
+        if price_data:
+            current_price_cents = price_data.get("final")
+            current_price = current_price_cents / 100 if current_price_cents is not None else None
+            discount_percentage = price_data.get("discount_percent")
+            
+            if current_price is not None:
+                steam_url = f"https://store.steampowered.com/app/{app_id}/"
+                
+                existing_price = session.query(PriceData).filter(
+                    PriceData.game_id == game_id,
+                    PriceData.store_name == 'Steam'
+                ).one_or_none()
+                
+                if existing_price:
+                    existing_price.current_price = current_price
+                    existing_price.discount_percentage = discount_percentage
+                    existing_price.url = steam_url
+                    existing_price.last_updated = datetime.now(UTC) 
+                else:
+                    new_price = PriceData(
+                        game_id=game_id,
+                        store_name='Steam',
+                        platform='PC',
+                        current_price=current_price,
+                        discount_percentage=discount_percentage,
+                        url=steam_url,
+                        last_updated=datetime.now(UTC) 
+                    )
+                    session.add(new_price)
+            
+            session.commit()
+            # Mensaje actualizado para incluir la portada
+            print(f"[{game_title}] ✅ Steam: Datos generales, precio y portada actualizados.") 
+        else:
+            session.commit()
+
+    except requests.exceptions.RequestException as e:
+        session.rollback()
+        print(f"[{game_title}] ❌ Steam: Error de red/API: {e}")
+    except Exception as e:
+        session.rollback()
+        print(f"[{game_title}] ❌ Steam: Error inesperado: {e}")
+    finally:
+        session.close()
+
+# -------------------------------------------------------------
+# 2. SCRAPER DE AMAZON (PLAYWRIGHT)
+# -------------------------------------------------------------
+
+def scrape_amazon_price(game_id: int, game_title: str):
+    """
+    Scraper para Amazon (usando Playwright) que busca y extrae el precio del primer resultado.
+    """
+    with sync_playwright() as p:
+        session = SessionLocal()
+        browser = None
+        
+        try:
+            search_query = game_title.replace(" ", "+")
+            # Uso de filtro de categoría (&rh=n:667611031) y búsqueda en 'videogames'
+            url = f"https://www.amazon.es/s?k={search_query}&i=videogames&rh=n:667611031"
+            
+            # 1. Iniciar el navegador y navegar
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            # Mayor timeout y espera a domcontentloaded
+            page.goto(url, wait_until="domcontentloaded", timeout=60000) 
+            
+            # 2. Buscar el primer contenedor de producto
+            first_product = page.locator('div[data-component-type="s-search-result"]').first
+            
+            if first_product.is_visible():
+                # 3. Extraer URL y Precio
+                
+                # Selector fijo: Buscar el enlace dentro del h2 (título) del producto
+                product_link_element = first_product.locator('h2 a').first
+                
+                if product_link_element.is_visible():
+                    product_url = product_link_element.get_attribute('href')
+                    if product_url and not product_url.startswith('http'):
+                        product_url = "https://www.amazon.es" + product_url
+                else:
+                    product_url = "#" 
+                
+                # Selector de precio: Buscar el elemento de precio oculto (.a-offscreen)
+                price_text = first_product.locator('.a-offscreen').first.inner_text()
+                
+                current_price = None
+                
+                if price_text:
+                    price_text = price_text.strip().replace('€', '').replace('$', '').replace(',', '.')
+                    try:
+                        current_price = float(price_text)
+                    except ValueError:
+                        current_price = None 
+                
+                
+                # --- Lógica de Descuento ---
+                discount_percentage = 0.0
+                platform = "Físico/Digital"
+                
+                if current_price is not None:
+                    reference_price = session.query(Game.reference_price).filter(Game.id == game_id).scalar()
+                    
+                    if reference_price and reference_price > 0 and current_price < reference_price:
+                        # Calcular el descuento basándose en el precio de referencia, no en el de la tienda
+                        discount_percentage = round((reference_price - current_price) / reference_price * 100, 0)
+                # --- Fin Lógica de Descuento ---
+
+                # 4. Crear o actualizar el registro en la tabla PriceData
+                if current_price is not None:
+                    existing_price = session.query(PriceData).filter(
+                        PriceData.game_id == game_id,
+                        PriceData.store_name == 'Amazon'
+                    ).one_or_none()
+                    
+                    if existing_price:
+                        existing_price.current_price = current_price
+                        existing_price.discount_percentage = discount_percentage
+                        existing_price.url = product_url
+                        existing_price.last_updated = datetime.now(UTC) 
+                    else:
+                        new_price = PriceData(
+                            game_id=game_id,
+                            store_name='Amazon',
+                            platform=platform,
+                            current_price=current_price,
+                            discount_percentage=discount_percentage,
+                            url=product_url,
+                            last_updated=datetime.now(UTC) 
+                        )
+                        session.add(new_price)
+                    
+                    session.commit()
+                    print(f"[{game_title}] ✅ Amazon: Precio actualizado a {current_price:.2f} ({discount_percentage:.0f}% OFF).")
+                else:
+                    print(f"[{game_title}] ⚠️ Amazon: Producto encontrado, pero precio no disponible/limpio.")
+                
+            else:
+                print(f"[{game_title}] ❌ Amazon: No se encontraron resultados principales en la búsqueda.")
+
+        except Exception as e:
+            session.rollback()
+            print(f"[{game_title}] ❌ Amazon: Error de Playwright/Scraping: {e}")
+        finally:
+            if browser:
+                browser.close()
+            session.close()
+
+# -------------------------------------------------------------
+# 3. ORQUESTADOR MULTICORE (ThreadExecutor)
+# -------------------------------------------------------------
+
+def run_scrapers_multicore():
+    """
+    Función principal que orquesta el scraping de Steam y Amazon en paralelo.
+    """
+    print("--- INICIANDO SCRAPER MULTICORE (STEAM y AMAZON) ---")
+    start_time = time.time()
+    
+    main_session = SessionLocal() 
+    
+    try:
+        games_to_scrape = main_session.query(Game.id, Game.title).all()
+        
+        if not games_to_scrape:
+            print("⚠️ No se encontraron juegos. Ejecuta 'repo_setup.py' primero.")
+            return
+
+        print(f"🔍 Encontrados {len(games_to_scrape)} juegos. Procesando en paralelo con {MAX_WORKERS} threads.")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            
+            futures = []
+            
+            for game_id, game_title in games_to_scrape:
+                # Tarea 1: Scrapeo de Steam (API rápida)
+                future_steam = executor.submit(scrape_steam_data, game_id, game_title)
+                futures.append(future_steam)
+                
+                # Tarea 2: Scrapeo de Amazon (Playwright lento)
+                future_amazon = executor.submit(scrape_amazon_price, game_id, game_title)
+                futures.append(future_amazon)
+                
+            # Esperar a que todas las tareas se completen
+            for future in as_completed(futures):
+                pass 
+                
+    finally:
+        main_session.close()
+        end_time = time.time()
+        print("\n--- SCRAPER MULTICORE FINALIZADO ---")
+        print(f"Tiempo total de ejecución: {end_time - start_time:.2f} segundos.")
+
+# -------------------------------------------------------------
+# 4. FUNCIÓN DE REPORTE (MODIFICADA)
+# -------------------------------------------------------------
+
+def display_final_data():
+    """
+    Consulta la base de datos y muestra un reporte estructurado, destacando la mejor oferta
+    (el precio más barato) entre todas las tiendas para cada juego.
+    """
+    session = SessionLocal()
+    try:
+        results = session.query(Game).all()
+        
+        print("\n=========================================================")
+        print("           REPORTE FINAL DE DATOS RECOLECTADOS          ")
+        print("=========================================================")
+        
+        for game in results:
+            print(f"\n--- 🎮 {game.title.upper()} ---")
+            # Muestra la URL de la portada (NUEVO para verificación)
+            print(f"    Portada URL: {game.cover_image_url or 'N/A'}")
+            print(f"    Referencia (MSRP): {game.reference_price:.2f} €")
+            print(f"    Lanzamiento: {game.release_date or 'N/A'}")
+            print(f"    Géneros: {game.genres or 'N/A'}")
+            print(f"    Rating (Metacritic/Steam): {game.steam_rating or 'N/A'}")
+            print(f"    ------------------------------------")
+            
+            prices = session.query(PriceData).filter(PriceData.game_id == game.id).all()
+            
+            # Lógica para encontrar la MEJOR OFERTA (precio más bajo)
+            best_deal = {
+                'price': float('inf'),
+                'discount': 0,
+                'store': 'N/A',
+                'platform': 'N/A'
+            }
+            
+            for price in prices:
+                # Solo consideramos precios válidos y si es mejor que la oferta actual
+                if price.current_price is not None and price.current_price < best_deal['price']:
+                    best_deal['price'] = price.current_price
+                    best_deal['discount'] = price.discount_percentage
+                    best_deal['store'] = price.store_name
+                    best_deal['platform'] = price.platform
+
+            # Mostrar la mejor oferta
+            if best_deal['price'] != float('inf'):
+                print(f"    💰 **MEJOR OFERTA ENCONTRADA (Amazon vs Steam):**")
+                print(f"        Tienda: **{best_deal['store']}** ({best_deal['platform']})")
+                print(f"        Precio MÁS BARATO: **{best_deal['price']:.2f} €**")
+                print(f"        Descuento MÁXIMO: **{best_deal['discount']:.0f}%**")
+            else:
+                print("    ⚠️ No se encontraron datos de precio válidos.")
+                
+            print(f"    ------------------------------------")
+            
+            # Mostrar el detalle de precios individuales (opcional, para verificación)
+            print(f"    Detalle de Precios Individuales:")
+            for price in prices:
+                print(f"        - {price.store_name} ({price.platform}): {price.current_price:.2f} € ({price.discount_percentage:.0f}%)")
+
+        print("\n=========================================================")
+
+    finally:
+        session.close()
+
+# -------------------------------------------------------------
+# 5. EJECUCIÓN PRINCIPAL
+# -------------------------------------------------------------
+
+if __name__ == '__main__':
+    run_scrapers_multicore()
+    display_final_data()
